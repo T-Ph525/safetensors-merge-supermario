@@ -1,156 +1,167 @@
-from pathlib import Path
-from time import sleep
-from tqdm import tqdm
-import argparse
-import requests
-import git
-import merge
 import os
 import shutil
-import sys
-import yaml
-from huggingface_hub import snapshot_download
-from huggingface_hub import HfApi, hf_hub_download
+import argparse
+import requests
+from tqdm import tqdm
+from huggingface_hub import HfApi, Repository, hf_hub_download, upload_folder
+from merge import merge_folder, map_tensors_to_files, copy_nontensor_files, save_tensor_map
+import logging
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Merge HuggingFace models")
-    parser.add_argument('repo_list', type=str, help='File containing list of repositories to merge, supports mergekit yaml or txt')
-    parser.add_argument('output_dir', type=str, help='Directory for the merged models')
-    parser.add_argument('-staging', type=str, default='./staging', help='Path to staging folder')
-    parser.add_argument('-p', type=float, default=0.5, help='Dropout probability')
-    parser.add_argument('-lambda', dest='lambda_val', type=float, default=1.0, help='Scaling factor for the weight delta')
-    parser.add_argument('--dry', action='store_true', help='Run in dry mode without making any changes')
-    return parser.parse_args()
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 
-def repo_list_generator(file_path, default_p, default_lambda_val):
-    _, file_extension = os.path.splitext(file_path)
+class RepositoryManager:
+    """
+    A class to manage HuggingFace repositories.
+    """
+    base_model_path = os.path.join(os.getcwd(), "base_model")
 
-    # Branching based on file extension
-    if file_extension.lower() == '.yaml' or file_extension.lower() == ".yml":
-        with open(file_path, 'r') as file:
-            data = yaml.safe_load(file)
+    def __init__(self, repo_id=None, token=None):
+        self.repo_id = repo_id
+        self.token = token
+        self.api = HfApi(token=token) if token else HfApi()
 
-        for model_info in data['models']:
-            model_name = model_info['model']
-            p = model_info.get('parameters', {}).get('weight', default_p)
-            lambda_val = 1 / model_info.get('parameters', {}).get('density', default_lambda_val)
-            yield model_name, p, lambda_val
+    def download_repo(self, repo_name, path):
+        """
+        Download a repository from HuggingFace.
 
-    else:  # Defaulting to txt file processing
-        with open(file_path, "r") as file:
-            repos_to_process = file.readlines()
+        Args:
+            repo_name (str): The name of the repository.
+            path (str): The path to save the downloaded repository.
+        """
+        if os.path.isdir(repo_name):
+            if not os.path.exists(path):
+                os.makedirs(path)
+            shutil.copytree(repo_name, path, dirs_exist_ok=True)
+        else:
+            if not os.path.exists(path):
+                os.makedirs(path)
 
-        for repo in repos_to_process:
-            yield repo.strip(), default_p, default_lambda_val
+            repo_files = self.api.list_repo_files(repo_name)
 
-def reset_directories(directories, dry_run):
-    for directory in directories:
-        if os.path.exists(directory):
-            if dry_run:
-                print(f"[DRY RUN] Would delete directory {directory}")
-            else:
-                # Check if the directory is a symlink
-                if os.path.islink(directory):
-                    os.unlink(directory)  # Remove the symlink
-                else:
-                    shutil.rmtree(directory, ignore_errors=False)
-                print(f"Directory {directory} deleted successfully.")
+            for file_path in tqdm(repo_files, desc=f"Downloading {repo_name}"):
+                file_url = f"https://huggingface.co/{repo_name}/resolve/main/{file_path}"
+                hf_hub_download(repo_id=repo_name, filename=file_path, cache_dir=path, local_dir=path)
 
-def do_merge(tensor_map, staging_path, p, lambda_val, dry_run=False):
-    if dry_run:
-        print(f"[DRY RUN] Would merge with {staging_path}")
-    else:
+    def delete_repo(self, path):
+        """
+        Delete a repository from the local filesystem.
+
+        Args:
+            path (str): The path to the repository.
+        """
+        shutil.rmtree(path, ignore_errors=True)
+
+class ModelMerger:
+    """
+    A class to merge models and upload them to HuggingFace.
+    """
+    def __init__(self, repo_id=None, token=None):
+        self.repo_id = repo_id
+        self.token = token
+        self.api = HfApi(token=token) if token else HfApi()
+        self.tensor_map = None
+
+    def prepare_base_model(self, base_model_name, base_model_path):
+        """
+        Prepare the base model by downloading it from HuggingFace.
+
+        Args:
+            base_model_name (str): The name of the base model.
+            base_model_path (str): The path to save the base model.
+        """
+        repo_manager = RepositoryManager(self.repo_id, self.token)
+        repo_manager.download_repo(base_model_name, base_model_path)
+        self.tensor_map = map_tensors_to_files(base_model_path)
+
+    def merge_repo(self, repo_name, repo_path, p, lambda_val):
+        """
+        Merge the base model with another model from HuggingFace.
+
+        Args:
+            repo_name (str): The name of the model to merge.
+            repo_path (str): The path to save the model to merge.
+            p (float): Dropout probability.
+            lambda_val (float): Scaling factor.
+        """
+        repo_manager = RepositoryManager(self.repo_id, self.token)
+        repo_manager.delete_repo(repo_path)
+        repo_manager.download_repo(repo_name, repo_path)
+
         try:
-            print(f"Merge operation for {staging_path}")
-            tensor_map = merge.merge_folder(tensor_map, staging_path, p, lambda_val)
-            print("Merge operation completed successfully.")
+            self.tensor_map = merge_folder(self.tensor_map, repo_path, p, lambda_val)
+            logging.info(f"Merged {repo_name}")
         except Exception as e:
-            print(f"Error during merge operation: {e}")
-    return tensor_map
+            logging.error(f"Error merging {repo_name}: {e}")
 
-def download_repo(repo_name, path, dry_run=False):
-    if not os.path.exists(path):
-        os.makedirs(path)
+    def finalize_merge(self, output_dir):
+        """
+        Finalize the merge by copying non-tensor files and saving the merged tensor map.
 
-    api = HfApi()
-    
-    # Get the list of all files in the repository using HfApi
-    repo_files = api.list_repo_files(repo_name)
+        Args:
+            output_dir (str): The path to the output directory.
+        """
+        base_model_path = os.path.join(os.getcwd(), "base_model")
 
-    if dry_run:
-        print(f"[DRY RUN] Would download the following files from {repo_name} to {path}:")
-        for file_path in repo_files:
-            print(file_path)
-    else:
-        print(f"Downloading the entire repository {repo_name} directly to {path}.")
-        
-        for file_path in repo_files:
-            print(f"Downloading {path}/{file_path}...")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
 
-            # Download each file directly to the specified path
-            hf_hub_download(
-                repo_id=repo_name, 
-                filename=file_path, 
-                cache_dir=path,
-                local_dir=path,  # Store directly in the target directory
-                local_dir_use_symlinks=False  # Ensure symlinks are not used
-            )
+        copy_nontensor_files(base_model_path, output_dir)
+        save_tensor_map(self.tensor_map, output_dir)
 
-        print(f"Repository {repo_name} downloaded successfully to {path}.")
+    def upload_model(self, output_dir, repo_name, commit_message):
+        """
+        Upload the merged model to HuggingFace.
 
-def should_create_symlink(repo_name):
-    if os.path.exists(repo_name):
-        return True, os.path.isfile(repo_name)
-    return False, False
-
-def download_or_link_repo(repo_name, path, dry_run=False):
-    symlink, is_file = should_create_symlink(repo_name)
-
-    if symlink and is_file:
-        os.makedirs(path, exist_ok=True)
-        symlink_path = os.path.join(path, os.path.basename(repo_name))
-        os.symlink(repo_name, symlink_path)
-    elif symlink:
-        os.symlink(repo_name, path)
-    else:
-        download_repo(repo_name, path, dry_run)
-
-def delete_repo(path, dry_run=False):
-    if dry_run:
-        print(f"[DRY RUN] Would delete repository at {path}")
-    else:
-        try:
-            shutil.rmtree(path)
-            print(f"Repository at {path} deleted successfully.")
-        except Exception as e:
-            print(f"Error deleting repository at {path}: {e}")
+        Args:
+            output_dir (str): The path to the output directory.
+            repo_name (str): The name of the repository to upload to.
+            commit_message (str): The commit message for the upload.
+        """
+        repo = Repository(local_dir=output_dir, clone_from=repo_name, use_auth_token=self.token)
+        repo.git_add(auto_lfs_track=True)
+        repo.git_commit(commit_message)
+        repo.git_push()
+        logging.info(f"Model uploaded to {repo_name}")
 
 def get_max_vocab_size(repo_list):
+    """
+    Get the maximum vocabulary size from a list of repositories.
+
+    Args:
+        repo_list (list): A list of repositories.
+
+    Returns:
+        tuple: A tuple containing the maximum vocabulary size and the repository with the maximum vocabulary size.
+    """
     max_vocab_size = 0
     repo_with_max_vocab = None
+    base_url = "https://huggingface.co/{}/raw/main/config.json"
 
-    for repo in repo_list:
-        repo_name = repo[0].strip()
-        url = f"https://huggingface.co/{repo_name}/raw/main/config.json"
-
+    for repo_name, _, _ in repo_list:
+        url = base_url.format(repo_name)
         try:
             response = requests.get(url)
-            response.raise_for_status()
             config = response.json()
-            vocab_size = config.get("vocab_size", 0)
-
+            vocab_size = config.get('vocab_size', 0)
             if vocab_size > max_vocab_size:
                 max_vocab_size = vocab_size
                 repo_with_max_vocab = repo_name
-
         except requests.RequestException as e:
-            print(f"Error fetching data from {url}: {e}")
+            logging.error(f"Error fetching vocab size from {repo_name}: {e}")
 
     return max_vocab_size, repo_with_max_vocab
 
 def download_json_files(repo_name, file_paths, output_dir):
-    base_url = f"https://huggingface.co/{repo_name}/raw/main/"
+    """
+    Download JSON files from a repository.
 
+    Args:
+        repo_name (str): The name of the repository.
+        file_paths (list): A list of file paths to download.
+        output_dir (str): The path to save the downloaded files.
+    """
+    base_url = f"https://huggingface.co/{repo_name}/raw/main/"
     for file_path in file_paths:
         url = base_url + file_path
         response = requests.get(url)
@@ -158,48 +169,39 @@ def download_json_files(repo_name, file_paths, output_dir):
             with open(os.path.join(output_dir, os.path.basename(file_path)), 'wb') as file:
                 file.write(response.content)
         else:
-            print(f"Failed to download {file_path}")
+            logging.error(f"Failed to download {file_path} from {repo_name}")
 
-def process_repos(output_dir, base_model, staging_model, repo_list_file, p, lambda_val, dry_run=False):
-    # Check if output_dir exists
-    if os.path.exists(output_dir):
-        sys.exit(f"Output directory '{output_dir}' already exists. Exiting to prevent data loss.")
+def main():
+    """
+    Main function to parse command-line arguments and orchestrate the merging and uploading process.
+    """
+    parser = argparse.ArgumentParser(description="Merge and upload HuggingFace models")
+    parser.add_argument('base_model', type=str, help='Base model safetensors file')
+    parser.add_argument('model_to_merge', type=str, help='Model to merge (.safetensors or .bin)')
+    parser.add_argument('-p', type=float, default=0.5, help='Dropout probability')
+    parser.add_argument('-lambda', '--lambda_value', type=float, default=3.0, help='Scaling factor (optional)')
+    parser.add_argument('--token', type=str, help='HuggingFace token (required for uploading)')
+    parser.add_argument('--repo', type=str, help='HuggingFace repo to upload to (required for uploading)')
+    parser.add_argument('--commit-message', type=str, default='Upload merged model', help='Commit message for model upload')
+    parser.add_argument('-U', '--upload', action='store_true', help='Upload the merged model to HuggingFace Hub')
+    args = parser.parse_args()
 
-    # Reset base and staging directories
-    reset_directories([base_model, staging_model], dry_run)
+    base_model_path = os.path.join(os.getcwd(), "base_model")
+    model_to_merge_path = os.path.join(os.getcwd(), "model_to_merge")
+    output_dir = os.path.join(os.getcwd(), "output")
 
-    repo_list_gen = repo_list_generator(repo_list_file, p, lambda_val)
+    model_merger = ModelMerger(args.repo, args.token)
+    model_merger.prepare_base_model(args.base_model, base_model_path)
 
-    repos_to_process = list(repo_list_gen)
+    model_merger.merge_repo(args.model_to_merge, model_to_merge_path, args.p, args.lambda_value)
 
-    # Initial download for 'base_model'
-    download_or_link_repo(repos_to_process[0][0].strip(), base_model, dry_run)
-    tensor_map = merge.map_tensors_to_files(base_model)
+    model_merger.finalize_merge(output_dir)
 
-    for i, repo in enumerate(tqdm(repos_to_process[1:], desc='Merging Repos')):
-        repo_name = repo[0].strip()
-        repo_p = repo[1]
-        repo_lambda = repo[2]
-        delete_repo(staging_model, dry_run)
-        download_or_link_repo(repo_name, staging_model, dry_run)
-        tensor_map = do_merge(tensor_map, staging_model, repo_p, repo_lambda, dry_run)
-
-    os.makedirs(output_dir, exist_ok=True)
-    merge.copy_nontensor_files(base_model, output_dir)
-
-    # Handle LLMs that add tokens by taking the largest
-    if os.path.exists(os.path.join(output_dir, 'config.json')):
-        max_vocab_size, repo_name = get_max_vocab_size(repos_to_process)
-        if max_vocab_size > 0:
-            file_paths = ['config.json', 'special_tokens_map.json', 'tokenizer.json', 'tokenizer_config.json']
-            download_json_files(repo_name, file_paths, output_dir)
-
-    reset_directories([base_model, staging_model], dry_run)
-    merge.save_tensor_map(tensor_map, output_dir)
+    if args.upload:
+        if not args.token or not args.repo:
+            logging.error("Error: HuggingFace token and repo name are required for uploading.")
+        else:
+            model_merger.upload_model(output_dir, args.repo, args.commit_message)
 
 if __name__ == "__main__":
-    args = parse_arguments()
-    staging_path = Path(args.staging)
-    os.makedirs(args.staging, exist_ok=True)
-    process_repos(args.output_dir, staging_path / 'base_model', staging_path / 'staging_model', args.repo_list, args.p, args.lambda_val, args.dry)
-
+    main()
